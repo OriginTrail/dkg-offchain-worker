@@ -280,9 +280,6 @@ impl pallet_template::Config for Runtime {
 	type Event = Event;
 }
 
-/// Payload data to be signed when making signed transaction from off-chain workers,
-///   inside `create_transaction` function.
-
 parameter_types! {
 	pub const GracePer: BlockNumber = 2;
 	pub const UnsignedInt: BlockNumber = 2;

@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "dkg-offchain-worker"
-version = "4.0.0-dev"
+version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
@@ -3540,7 +3540,7 @@ dependencies = [
 
 [[package]]
 name = "node-template"
-version = "3.0.0-monthly-2021-10"
+version = "3.0.0-monthly-2021-10-with-DKG-Offchain-Worker-0.1.0"
 dependencies = [
  "frame-benchmarking",
  "frame-benchmarking-cli",
