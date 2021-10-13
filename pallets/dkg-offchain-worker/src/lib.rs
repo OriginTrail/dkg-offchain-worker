@@ -19,19 +19,11 @@ use codec::{Decode, Encode};
 use frame_support::traits::Get;
 use frame_system::{
 	self as system,
-	offchain::{
-		AppCrypto, CreateSignedTransaction, SendSignedTransaction, SendUnsignedTransaction,
-		SignedPayload, Signer, SigningTypes, SubmitTransaction,
-	},
+	offchain::{AppCrypto, CreateSignedTransaction, SignedPayload, SigningTypes},
 };
-use lite_json::json::JsonValue;
 use sp_core::crypto::KeyTypeId;
 use sp_runtime::{
-	offchain::{
-		http,
-		storage::{MutateStorageError, StorageRetrievalError, StorageValueRef},
-		Duration,
-	},
+	offchain::{http, Duration},
 	traits::Zero,
 	transaction_validity::{InvalidTransaction, TransactionValidity, ValidTransaction},
 	RuntimeDebug,
@@ -52,7 +44,7 @@ mod tests;
 pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"btc!");
 
 /// Defines HTTP Endpoint of local OriginTrail node
-const HTTP_REMOTE_REQUEST: &str = "http://0.0.0.0:8900/api/latest/trail";
+//const HTTP_REMOTE_REQUEST: &str = "http://0.0.0.0:8900/";
 
 /// Based on the above `KeyTypeId` we need to generate a pallet-specific crypto type wrappers.
 /// We can use from supported crypto kinds (`sr25519`, `ed25519` and `ecdsa`) and augment
@@ -147,33 +139,18 @@ pub mod pallet {
 			let parent_hash = <system::Pallet<T>>::block_hash(block_number - 1u32.into());
 			log::info!("Current block: {:?} (parent hash: {:?})", block_number, parent_hash);
 
-			// Fetching and printing data from dkg
-			let dkg_data = Self::fetch_dkg_data();
-
-			// It's a good practice to keep `fn offchain_worker()` function minimal, and move most
-			// of the code to separate `impl` block.
-			// Here we call a helper function to calculate current average price.
-			// This function reads storage entries of the current state.
-			// let average: Option<u32> = Self::average_price();
-			// log::debug!("Current price: {:?}", average);
-
-			// For this example we are going to send both signed and unsigned transactions
-			// depending on the block number.
-			// Usually it's enough to choose one or the other.
-			let should_send = Self::choose_transaction_type(block_number);
-			let res = match should_send {
-				TransactionType::Signed => Self::fetch_price_and_send_signed(),
-				TransactionType::UnsignedForAny => {
-					Self::fetch_price_and_send_unsigned_for_any_account(block_number)
-				}
-				TransactionType::UnsignedForAll => {
-					Self::fetch_price_and_send_unsigned_for_all_accounts(block_number)
-				}
-				TransactionType::Raw => Self::fetch_price_and_send_raw_unsigned(block_number),
-				TransactionType::None => Ok(()),
-			};
-			if let Err(e) = res {
-				log::error!("Error: {}", e);
+			let num = block_number % 3u32.into();
+			if num == Zero::zero() {
+				let _res_nq = Self::dkg_network_query();
+			// Work with data queried from network
+			} else if num == T::BlockNumber::from(1u32) {
+				let _res_nf = Self::dkg_node_info();
+			// Work with node info data
+			} else if num == T::BlockNumber::from(2u32) {
+				let _res_trail = Self::dkg_trail();
+			// Work with data returned by trail
+			} else {
+				log::error!("Unexpected behaviour!");
 			}
 		}
 	}
@@ -324,220 +301,10 @@ impl<T: SigningTypes> SignedPayload<T> for PricePayload<T::Public, T::BlockNumbe
 	}
 }
 
-enum TransactionType {
-	Signed,
-	UnsignedForAny,
-	UnsignedForAll,
-	Raw,
-	None,
-}
-
 impl<T: Config> Pallet<T> {
-	/// Chooses which transaction type to send.
-	///
-	/// This function serves mostly to showcase `StorageValue` helper
-	/// and local storage usage.
-	///
-	/// Returns a type of transaction that should be produced in current run.
-	fn choose_transaction_type(block_number: T::BlockNumber) -> TransactionType {
-		/// A friendlier name for the error that is going to be returned in case we are in the grace
-		/// period.
-		const RECENTLY_SENT: () = ();
+	fn dkg_trail() -> Result<serde_json::Value, http::Error> {
+		log::info!("Getting trail for dataset with identifier test1:");
 
-		// Start off by creating a reference to Local Storage value.
-		// Since the local storage is common for all offchain workers, it's a good practice
-		// to prepend your entry with the module name.
-		let val = StorageValueRef::persistent(b"dkg_offchain_worker::last_send");
-		// The Local Storage is persisted and shared between runs of the offchain workers,
-		// and offchain workers may run concurrently. We can use the `mutate` function, to
-		// write a storage entry in an atomic fashion. Under the hood it uses `compare_and_set`
-		// low-level method of local storage API, which means that only one worker
-		// will be able to "acquire a lock" and send a transaction if multiple workers
-		// happen to be executed concurrently.
-		let res = val.mutate(|last_send: Result<Option<T::BlockNumber>, StorageRetrievalError>| {
-			match last_send {
-				// If we already have a value in storage and the block number is recent enough
-				// we avoid sending another transaction at this time.
-				Ok(Some(block)) if block_number < block + T::GracePeriod::get() => {
-					Err(RECENTLY_SENT)
-				}
-				// In every other case we attempt to acquire the lock and send a transaction.
-				_ => Ok(block_number),
-			}
-		});
-
-		// The result of `mutate` call will give us a nested `Result` type.
-		// The first one matches the return of the closure passed to `mutate`, i.e.
-		// if we return `Err` from the closure, we get an `Err` here.
-		// In case we return `Ok`, here we will have another (inner) `Result` that indicates
-		// if the value has been set to the storage correctly - i.e. if it wasn't
-		// written to in the meantime.
-		match res {
-			// The value has been set correctly, which means we can safely send a transaction now.
-			Ok(block_number) => {
-				// Depending if the block is even or odd we will send a `Signed` or `Unsigned`
-				// transaction.
-				// Note that this logic doesn't really guarantee that the transactions will be sent
-				// in an alternating fashion (i.e. fairly distributed). Depending on the execution
-				// order and lock acquisition, we may end up for instance sending two `Signed`
-				// transactions in a row. If a strict order is desired, it's better to use
-				// the storage entry for that. (for instance store both block number and a flag
-				// indicating the type of next transaction to send).
-				let transaction_type = block_number % 3u32.into();
-				if transaction_type == Zero::zero() {
-					TransactionType::Signed
-				} else if transaction_type == T::BlockNumber::from(1u32) {
-					TransactionType::UnsignedForAny
-				} else if transaction_type == T::BlockNumber::from(2u32) {
-					TransactionType::UnsignedForAll
-				} else {
-					TransactionType::Raw
-				}
-			}
-			// We are in the grace period, we should not send a transaction this time.
-			Err(MutateStorageError::ValueFunctionFailed(RECENTLY_SENT)) => TransactionType::None,
-			// We wanted to send a transaction, but failed to write the block number (acquire a
-			// lock). This indicates that another offchain worker that was running concurrently
-			// most likely executed the same logic and succeeded at writing to storage.
-			// Thus we don't really want to send the transaction, knowing that the other run
-			// already did.
-			Err(MutateStorageError::ConcurrentModification(_)) => TransactionType::None,
-		}
-	}
-
-	/// A helper function to fetch the price and send signed transaction.
-	fn fetch_price_and_send_signed() -> Result<(), &'static str> {
-		let signer = Signer::<T, T::AuthorityId>::all_accounts();
-		if !signer.can_sign() {
-			return Err(
-				"No local accounts available. Consider adding one via `author_insertKey` RPC.",
-			)?;
-		}
-		// Make an external HTTP request to fetch the current price.
-		// Note this call will block until response is received.
-		let price = Self::fetch_price().map_err(|_| "Failed to fetch price")?;
-
-		// Using `send_signed_transaction` associated type we create and submit a transaction
-		// representing the call, we've just created.
-		// Submit signed will return a vector of results for all accounts that were found in the
-		// local keystore with expected `KEY_TYPE`.
-		let results = signer.send_signed_transaction(|_account| {
-			// Received price is wrapped into a call to `submit_price` public function of this
-			// pallet. This means that the transaction, when executed, will simply call that
-			// function passing `price` as an argument.
-			Call::submit_price { price }
-		});
-
-		for (acc, res) in &results {
-			match res {
-				Ok(()) => log::info!("[{:?}] Submitted price of {} cents", acc.id, price),
-				Err(e) => log::error!("[{:?}] Failed to submit transaction: {:?}", acc.id, e),
-			}
-		}
-
-		Ok(())
-	}
-
-	/// A helper function to fetch the price and send a raw unsigned transaction.
-	fn fetch_price_and_send_raw_unsigned(block_number: T::BlockNumber) -> Result<(), &'static str> {
-		// Make sure we don't fetch the price if unsigned transaction is going to be rejected
-		// anyway.
-		let next_unsigned_at = <NextUnsignedAt<T>>::get();
-		if next_unsigned_at > block_number {
-			return Err("Too early to send unsigned transaction");
-		}
-
-		// Make an external HTTP request to fetch the current price.
-		// Note this call will block until response is received.
-		let price = Self::fetch_price().map_err(|_| "Failed to fetch price")?;
-
-		// Received price is wrapped into a call to `submit_price_unsigned` public function of this
-		// pallet. This means that the transaction, when executed, will simply call that function
-		// passing `price` as an argument.
-		let call = Call::submit_price_unsigned { block_number, price };
-
-		// Now let's create a transaction out of this call and submit it to the pool.
-		// Here we showcase two ways to send an unsigned transaction / unsigned payload (raw)
-		//
-		// By default unsigned transactions are disallowed, so we need to whitelist this case
-		// by writing `UnsignedValidator`. Note that it's EXTREMELY important to carefuly
-		// implement unsigned validation logic, as any mistakes can lead to opening DoS or spam
-		// attack vectors. See validation logic docs for more details.
-		//
-		SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into())
-			.map_err(|()| "Unable to submit unsigned transaction.")?;
-
-		Ok(())
-	}
-
-	/// A helper function to fetch the price, sign payload and send an unsigned transaction
-	fn fetch_price_and_send_unsigned_for_any_account(
-		block_number: T::BlockNumber,
-	) -> Result<(), &'static str> {
-		// Make sure we don't fetch the price if unsigned transaction is going to be rejected
-		// anyway.
-		let next_unsigned_at = <NextUnsignedAt<T>>::get();
-		if next_unsigned_at > block_number {
-			return Err("Too early to send unsigned transaction");
-		}
-
-		// Make an external HTTP request to fetch the current price.
-		// Note this call will block until response is received.
-		let price = Self::fetch_price().map_err(|_| "Failed to fetch price")?;
-
-		// -- Sign using any account
-		let (_, result) = Signer::<T, T::AuthorityId>::any_account()
-			.send_unsigned_transaction(
-				|account| PricePayload { price, block_number, public: account.public.clone() },
-				|payload, signature| Call::submit_price_unsigned_with_signed_payload {
-					price_payload: payload,
-					signature,
-				},
-			)
-			.ok_or(" ")?;
-		result.map_err(|()| "Unable to submit transaction")?;
-
-		Ok(())
-	}
-
-	/// A helper function to fetch the price, sign payload and send an unsigned transaction
-	fn fetch_price_and_send_unsigned_for_all_accounts(
-		block_number: T::BlockNumber,
-	) -> Result<(), &'static str> {
-		// Make sure we don't fetch the price if unsigned transaction is going to be rejected
-		// anyway.
-		let next_unsigned_at = <NextUnsignedAt<T>>::get();
-		if next_unsigned_at > block_number {
-			return Err("Too early to send unsigned transaction");
-		}
-
-		// Make an external HTTP request to fetch the current price.
-		// Note this call will block until response is received.
-		let price = Self::fetch_price().map_err(|_| "Failed to fetch price")?;
-
-		// -- Sign using all accounts
-		let transaction_results = Signer::<T, T::AuthorityId>::all_accounts()
-			.send_unsigned_transaction(
-				|account| PricePayload { price, block_number, public: account.public.clone() },
-				|payload, signature| Call::submit_price_unsigned_with_signed_payload {
-					price_payload: payload,
-					signature,
-				},
-			);
-		for (_account_id, result) in transaction_results.into_iter() {
-			if result.is_err() {
-				return Err("Unable to submit transaction");
-			}
-		}
-
-		Ok(())
-	}
-
-	fn fetch_dkg_data() -> Result<serde_json::Value, http::Error> {
-		// let fetched_value = Self::fetch_n_parse().unwrap();
-		// log::info!("{:#?}", &fetched_value);
-
-		// log::info!("Identifier value is test1: {}", Self::check_value(fetched_value));
 		let query = r#"
 			{
 				"identifier_types": ["id"],
@@ -548,7 +315,7 @@ impl<T: Config> Pallet<T> {
 
 		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
 
-		let request = http::Request::post(HTTP_REMOTE_REQUEST, vec![query]);
+		let request = http::Request::post("http://0.0.0.0:8900/api/latest/trail", vec![query]);
 
 		let pending = request
 			.add_header("Content-Type", "application/json")
@@ -556,7 +323,8 @@ impl<T: Config> Pallet<T> {
 			.send()
 			.map_err(|_| http::Error::IoError)?;
 
-		let response = pending.try_wait(deadline).map_err(|_| http::Error::DeadlineReached)??;
+		let response =
+			pending.try_wait(deadline).map_err(|_| http::Error::DeadlineReached).unwrap()?;
 		// Let's check the status code before we proceed to reading the response.
 		if response.code != 200 {
 			log::warn!("Unexpected status code: {}", response.code);
@@ -570,85 +338,43 @@ impl<T: Config> Pallet<T> {
 
 		let trail_data: serde_json::Value = serde_json::from_str(body_str).unwrap();
 
-		log::info!("{:#?}", &trail_data);
+		log::info!("Trail data\n:{:#?}", &trail_data);
 
 		Ok(trail_data)
 	}
 
-	/// Fetch current price and return the result in cents.
-	fn fetch_price() -> Result<u32, http::Error> {
-		// We want to keep the offchain worker execution time reasonable, so we set a hard-coded
-		// deadline to 2s to complete the external call.
-		// You can also wait idefinitely for the response, however you may still get a timeout
-		// coming from the host machine.
-		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
-		// Initiate an external HTTP GET request.
-		// This is using high-level wrappers from `sp_runtime`, for the low-level calls that
-		// you can find in `sp_io`. The API is trying to be similar to `reqwest`, but
-		// since we are running in a custom WASM execution environment we can't simply
-		// import the library here.
-		let request =
-			http::Request::get("https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD");
-		// We set the deadline for sending of the request, note that awaiting response can
-		// have a separate deadline. Next we send the request, before that it's also possible
-		// to alter request headers or stream body content in case of non-GET requests.
-		let pending = request.deadline(deadline).send().map_err(|_| http::Error::IoError)?;
+	fn dkg_node_info() -> Result<serde_json::Value, http::Error> {
+		log::info!("Getting node info:");
 
-		// The request is already being processed by the host, we are free to do anything
-		// else in the worker (we can send multiple concurrent requests too).
-		// At some point however we probably want to check the response though,
-		// so we can block current thread and wait for it to finish.
-		// Note that since the request is being driven by the host, we don't have to wait
-		// for the request to have it complete, we will just not read the response.
-		let response = pending.try_wait(deadline).map_err(|_| http::Error::DeadlineReached)??;
-		// Let's check the status code before we proceed to reading the response.
+		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
+
+		let request = http::Request::get("http://0.0.0.0:8900/api/latest/info");
+
+		let pending = request.deadline(deadline).send().map_err(|_| http::Error::IoError).unwrap();
+
+		let response =
+			pending.try_wait(deadline).map_err(|_| http::Error::DeadlineReached).unwrap()?;
+
 		if response.code != 200 {
 			log::warn!("Unexpected status code: {}", response.code);
 			return Err(http::Error::Unknown);
 		}
 
-		// Next we want to fully read the response body and collect it to a vector of bytes.
-		// Note that the return object allows you to read the body in chunks as well
-		// with a way to control the deadline.
 		let body = response.body().collect::<Vec<u8>>();
 
 		// Create a str slice from the body.
-		let body_str = sp_std::str::from_utf8(&body).map_err(|_| {
-			log::warn!("No UTF8 body");
-			http::Error::Unknown
-		})?;
+		let body_str = sp_std::str::from_utf8(&body).unwrap();
 
-		let price = match Self::parse_price(body_str) {
-			Some(price) => Ok(price),
-			None => {
-				log::warn!("Unable to extract price from the response: {:?}", body_str);
-				Err(http::Error::Unknown)
-			}
-		}?;
+		let node_info_data: serde_json::Value = serde_json::from_str(body_str).unwrap();
 
-		// log::warn!("Got price: {} cents", price);
+		log::info!("{:#?}", &node_info_data);
 
-		Ok(price)
+		Ok(node_info_data)
 	}
 
-	/// Parse the price from the given JSON string using `lite-json`.
-	///
-	/// Returns `None` when parsing failed or `Some(price in cents)` when parsing is successful.
-	fn parse_price(price_str: &str) -> Option<u32> {
-		let val = lite_json::parse_json(price_str);
-		let price = match val.ok()? {
-			JsonValue::Object(obj) => {
-				let (_, v) = obj.into_iter().find(|(k, _)| k.iter().copied().eq("USD".chars()))?;
-				match v {
-					JsonValue::Number(number) => number,
-					_ => return None,
-				}
-			}
-			_ => return None,
-		};
-
-		let exp = price.fraction_length.checked_sub(2).unwrap_or(0);
-		Some(price.integer as u32 * 100 + (price.fraction / 10_u64.pow(exp)) as u32)
+	fn dkg_network_query() {
+		// Mockup
+		log::info!("Executing network query!");
 	}
 
 	/// Add new price to the list.
